@@ -79,9 +79,22 @@ vi.mock("@percolatorct/shared", () => ({
   eventBus: { publish: vi.fn() },
 }));
 
+// After the #119 merge, crank.ts routes sends through keeperSend (not shared.sendWithRetryKeeper
+// directly), so success/failure determinism for these tests must be enforced at the keeperSend
+// layer. Without this mock, keeperSend's priority-fee + CU-sim path rejects before reaching
+// sendWithRetryKeeper, which silently turns success-path tests into failure-path tests.
+vi.mock("../../src/lib/keeper-send.js", async () => {
+  const { KeeperBudget } = await vi.importActual<typeof import("../../src/lib/budget.js")>("../../src/lib/budget.js");
+  return {
+    keeperSend: vi.fn(async () => ({ signature: "mock-keeper-sig", estimatedCost: 5000 })),
+    sharedBudget: new KeeperBudget(),
+  };
+});
+
 import { PublicKey } from "@solana/web3.js";
 import { CrankService } from "../../src/services/crank.js";
 import * as shared from "@percolatorct/shared";
+import * as keeperSendModule from "../../src/lib/keeper-send.js";
 
 function makeMarketState(opts: Partial<{ consecutiveFailures: number; failureCount: number; successCount: number; alertedAt5: boolean }> = {}) {
   return {
@@ -127,13 +140,13 @@ describe("crank B-fixes — B1 alert latch", () => {
   afterEach(() => crank.stop());
 
   it("does not fire while consecutiveFailures < 5", async () => {
-    vi.mocked(shared.sendWithRetryKeeper).mockRejectedValue(new Error("boom"));
+    vi.mocked(keeperSendModule.keeperSend).mockRejectedValue(new Error("boom"));
     for (let i = 0; i < 4; i++) await crank.crankMarket(slab);
     expect(alertSpy).not.toHaveBeenCalled();
   });
 
   it("fires exactly once when consecutiveFailures crosses 5 (5,6,7,8 → 1 alert)", async () => {
-    vi.mocked(shared.sendWithRetryKeeper).mockRejectedValue(new Error("boom"));
+    vi.mocked(keeperSendModule.keeperSend).mockRejectedValue(new Error("boom"));
     for (let i = 0; i < 8; i++) await crank.crankMarket(slab);
     expect(alertSpy).toHaveBeenCalledTimes(1);
     expect((crank as any).markets.get(slab).alertedAt5).toBe(true);
@@ -143,24 +156,24 @@ describe("crank B-fixes — B1 alert latch", () => {
     // Pre-load consecutiveFailures = 5 (simulating jump). The fix uses `>= 5 && !alertedAt5`.
     const state = (crank as any).markets.get(slab);
     state.consecutiveFailures = 5;
-    vi.mocked(shared.sendWithRetryKeeper).mockRejectedValue(new Error("boom"));
+    vi.mocked(keeperSendModule.keeperSend).mockRejectedValue(new Error("boom"));
     await crank.crankMarket(slab); // bumps to 6, should still fire
     expect(alertSpy).toHaveBeenCalledTimes(1);
   });
 
   it("latch resets on success so a second streak can alert again", async () => {
-    vi.mocked(shared.sendWithRetryKeeper).mockRejectedValue(new Error("boom"));
+    vi.mocked(keeperSendModule.keeperSend).mockRejectedValue(new Error("boom"));
     for (let i = 0; i < 6; i++) await crank.crankMarket(slab);
     expect(alertSpy).toHaveBeenCalledTimes(1);
 
     // success path
-    vi.mocked(shared.sendWithRetryKeeper).mockResolvedValueOnce("ok-sig");
+    vi.mocked(keeperSendModule.keeperSend).mockResolvedValueOnce({ signature: "ok-sig", estimatedCost: 5000 } as any);
     await crank.crankMarket(slab);
     expect((crank as any).markets.get(slab).consecutiveFailures).toBe(0);
     expect((crank as any).markets.get(slab).alertedAt5).toBe(false);
 
     // second streak should fire again
-    vi.mocked(shared.sendWithRetryKeeper).mockRejectedValue(new Error("boom2"));
+    vi.mocked(keeperSendModule.keeperSend).mockRejectedValue(new Error("boom2"));
     for (let i = 0; i < 6; i++) await crank.crankMarket(slab);
     expect(alertSpy).toHaveBeenCalledTimes(2);
   });
@@ -180,7 +193,7 @@ describe("crank B-fixes — B10 lifetime failureCount preservation", () => {
   afterEach(() => crank.stop());
 
   it("success resets consecutiveFailures but preserves lifetime failureCount", async () => {
-    vi.mocked(shared.sendWithRetryKeeper).mockResolvedValueOnce("ok-sig");
+    vi.mocked(keeperSendModule.keeperSend).mockResolvedValueOnce({ signature: "ok-sig", estimatedCost: 5000 } as any);
     await crank.crankMarket(slab);
     const state = (crank as any).markets.get(slab);
     expect(state.consecutiveFailures).toBe(0);
