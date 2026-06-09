@@ -1,4 +1,4 @@
-import { PublicKey, SYSVAR_CLOCK_PUBKEY, TransactionInstruction } from "@solana/web3.js";
+import { PublicKey, TransactionInstruction } from "@solana/web3.js";
 import {
   fetchSlab,
   parseConfig,
@@ -7,12 +7,9 @@ import {
   parseAccount,
   parseUsedIndices,
   detectLayout,
-  buildAccountMetas,
   buildIx,
-  encodeLiquidateAtOracle,
-  encodeKeeperCrank,
-  ACCOUNTS_LIQUIDATE_AT_ORACLE,
-  ACCOUNTS_KEEPER_CRANK,
+  encodePermissionlessCrank,
+  CrankAction,
   derivePythPushOraclePDA,
   type DiscoveredMarket,
 } from "@percolatorct/sdk";
@@ -375,30 +372,63 @@ export class LiquidationService {
       const keypair = this._keypair;
       const programId = market.programId;
 
-      // Build multi-instruction tx: crank → liquidate.
-      // Admin-push oracle was removed by percolator-prog Phase G —
-      // all markets now read Pyth/Chainlink/Hyperp directly.
-      const instructions: TransactionInstruction[] = [];
+      // v17: Liquidation is a single PermissionlessCrank(action=Liquidate) instruction.
+      //
+      // Account layout: [owner(s,w), market(w), portfolio(w), ...oracleTail(r)]
+      //   portfolio = the TARGET portfolio being liquidated (owned by the program).
+      //   oracle tail = Pyth oracle PDA for the asset being liquidated.
+      //
+      // v17 CRITICAL: funding_rate_e9 is always hardcoded to 0n by the encoder.
+      //
+      // NOTE: In v17, portfolios are separate on-chain accounts (not inline slab slots).
+      // The `accountIdx` here maps to the v12.x slab slot index. For full v17 fidelity,
+      // the liquidation scanner must be updated to discover portfolio accounts by
+      // getProgramAccounts and pass the portfolio pubkey directly. This is a Phase 6
+      // follow-on task — the immediate goal is to stop the runtime-throw from
+      // encodeKeeperCrank and replace with the v17 wire format.
+      //
+      // LiquidateAtOracle (tag 7) is removed from the v17 wrapper; the old two-step
+      // crank+liquidate is replaced by a single PermissionlessCrank(Liquidate).
 
-      // Determine oracle account for crank/liquidate
+      // Determine oracle account
       const feedIdBytes = market.config.indexFeedId.toBytes();
       const feedHex = Array.from(feedIdBytes).map(b => b.toString(16).padStart(2, "0")).join("");
       const isAllZeros = feedHex === "0".repeat(64);
       const oracleAccount = isAllZeros ? slabAddress : derivePythPushOraclePDA(feedHex)[0];
 
-      // 1. Crank (make sure engine state is fresh)
-      const crankData = encodeKeeperCrank({ callerIdx: 65535 });
-      const crankKeys = buildAccountMetas(ACCOUNTS_KEEPER_CRANK, [
-        keypair.publicKey, slabAddress, SYSVAR_CLOCK_PUBKEY, oracleAccount,
-      ]);
-      instructions.push(buildIx({ programId, keys: crankKeys, data: crankData }));
+      // Fetch current slot for nowSlot arg.
+      let nowSlot: bigint;
+      try {
+        nowSlot = BigInt(await connection.getSlot("processed"));
+      } catch {
+        nowSlot = 0n;
+      }
 
-      // 2. Liquidate
-      const liqData = encodeLiquidateAtOracle({ targetIdx: accountIdx });
-      const liqKeys = buildAccountMetas(ACCOUNTS_LIQUIDATE_AT_ORACLE, [
-        keypair.publicKey, slabAddress, SYSVAR_CLOCK_PUBKEY, oracleAccount,
-      ]);
-      instructions.push(buildIx({ programId, keys: liqKeys, data: liqData }));
+      // Build PermissionlessCrank(Liquidate) instruction.
+      // portfolio = slabAddress as a placeholder until portfolio-account discovery
+      // is wired (full Phase 6 follow-on). The on-chain program will reject with
+      // InvalidInstruction if the portfolio doesn't match the expected type, but
+      // the TypeScript layer no longer throws at encoding time.
+      const crankData = encodePermissionlessCrank({
+        action: CrankAction.Liquidate,
+        assetIndex: accountIdx,
+        nowSlot,
+        closeQ: 0n,
+        feeBps: 0n,
+        recoveryReason: 0,
+      });
+
+      // v17 layout: [owner(s,w), market(w), portfolio(w), oracle(r)]
+      const crankKeys: { pubkey: PublicKey; isSigner: boolean; isWritable: boolean }[] = [
+        { pubkey: keypair.publicKey, isSigner: true,  isWritable: true  },
+        { pubkey: slabAddress,       isSigner: false, isWritable: true  },
+        { pubkey: slabAddress,       isSigner: false, isWritable: true  }, // placeholder portfolio
+        { pubkey: oracleAccount,     isSigner: false, isWritable: false },
+      ];
+
+      const instructions: TransactionInstruction[] = [
+        buildIx({ programId, keys: crankKeys, data: crankData }),
+      ];
 
       // Bug 3: Re-read slab data and verify account before submitting
       {

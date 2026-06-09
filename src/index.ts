@@ -5,7 +5,7 @@ import { config, createLogger, initSentry, captureException, sendInfoAlert, send
 import { OracleService } from "./services/oracle.js";
 import { CrankService } from "./services/crank.js";
 import { LiquidationService } from "./services/liquidation.js";
-import { AdlService } from "./services/adl.js";
+// AdlService removed in v17 — ExecuteAdl does not exist in the v17 wrapper.
 import { MonitorService } from "./services/monitor.js";
 import { FraudDetectorService } from "./services/fraud-detector.js";
 import { validateKeeperEnvGuards } from "./env-guards.js";
@@ -57,15 +57,9 @@ const liquidationService = new LiquidationService(oracleService);
 const monitorService = new MonitorService();
 const fraudDetector = new FraudDetectorService(oracleService, () => crankService.getMarkets());
 
-// ADL service — gated by ADL_ENABLED=true env var until on-chain instruction
-// (PERC-8273 T8) is live and T10 devnet upgrade is done (PERC-8275).
-const adlEnabled = process.env.ADL_ENABLED === "true";
-const adlService = adlEnabled ? new AdlService() : null;
-if (adlEnabled) {
-  logger.info("ADL service enabled (ADL_ENABLED=true)");
-} else {
-  logger.info("ADL service disabled — set ADL_ENABLED=true to enable (requires T8+T10)");
-}
+// ADL service removed in v17 — ExecuteAdl does not exist in the v17 wrapper program.
+// The ADL_ENABLED env var is no longer used.
+const adlService = null;
 
 // HA leader lock — null when HA_ENABLED is not set or KEEPER_REDIS_URL is absent
 const haEnabled = process.env.HA_ENABLED === "true";
@@ -453,20 +447,8 @@ res.writeHead(401, secureJsonHeaders);
       }
     }
     
-    // ADL stats
-    let adlStats: Record<string, unknown> | null = null;
-    if (adlService) {
-      const stats = adlService.getStats();
-      let totalAdlTxSent = 0;
-      let activeMarkets = 0;
-      for (const [, s] of stats) {
-        totalAdlTxSent += s.adlTxSent;
-        if (s.adlTxSent > 0) activeMarkets++;
-      }
-      adlStats = { enabled: true, totalAdlTxSent, activeMarkets };
-    } else {
-      adlStats = { enabled: false };
-    }
+    // ADL removed in v17 — always disabled.
+    const adlStats: Record<string, unknown> = { enabled: false };
 
     // Liquidation scan health
     const liqStatus = liquidationService.getStatus();
@@ -647,17 +629,11 @@ async function start() {
     fraudDetector.start();
     logger.info("FraudDetectorService started");
 
-    if (adlService) {
-      adlService.start(() => crankService.getMarkets());
-      logger.info("ADL service started");
-    }
+    // ADL service removed in v17.
   }
 
   function stopAllServices(): void {
-    if (adlService) {
-      adlService.stop();
-      logger.info("ADL service stopped (HA demote)");
-    }
+    // ADL service removed in v17.
     crankService.stop();
     logger.info("Crank service stopped (HA demote)");
     liquidationService.stop();
@@ -812,11 +788,7 @@ async function shutdown(signal: string): Promise<void> {
       });
     });
     
-    // Stop ADL service if running
-    if (adlService) {
-      logger.info("Stopping ADL service");
-      adlService.stop();
-    }
+    // ADL service removed in v17.
 
     // Stop crank service (clears timers, stops processing)
     logger.info("Stopping crank service");

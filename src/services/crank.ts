@@ -1,22 +1,17 @@
-import { PublicKey, SYSVAR_CLOCK_PUBKEY } from "@solana/web3.js";
+import { PublicKey } from "@solana/web3.js";
 import type { Connection, TransactionInstruction } from "@solana/web3.js";
 import {
   discoverMarkets,
-  encodeKeeperCrank,
-  encodeUpdateHyperpMark,
-  buildAccountMetas,
+  encodePermissionlessCrank,
+  CrankAction,
   buildIx,
   derivePythPushOraclePDA,
-  ACCOUNTS_KEEPER_CRANK,
   fetchSlab,
   parseHeader,
   parseConfig,
   parseEngine,
   parseParams,
-  detectDexType,
-  parseDexPool,
   type DiscoveredMarket,
-  type DexType,
 } from "@percolatorct/sdk";
 import { config, getConnection, getFallbackConnection, loadKeypair, eventBus, createLogger, sendCriticalAlert, getSupabase } from "@percolatorct/shared";
 import { OracleService } from "./oracle.js";
@@ -26,8 +21,6 @@ import {
   solSpentLamportsTotal,
   cycleDurationSeconds,
   txLandTimeSeconds,
-  updateHyperpMarkTotal,
-  updateHyperpMarkCu,
 } from "../lib/metrics.js";
 import type { AccountLoader } from "../lib/account-loader.js";
 import { keeperSend, sharedBudget } from "../lib/keeper-send.js";
@@ -92,24 +85,13 @@ interface MarketCrankState {
    */
   foreignOracleSkipped?: boolean;
   /**
-   * PERC-1254: Hyperp-mode market (indexFeedId=all-zeros) where authority_price_e6=0 on-chain
-   * and fetchPrice returned null — cranking would cause OracleInvalid (0xc).
-   * Reset to false once a price push succeeds or on-chain price is non-zero.
+   * v17: The keeper's own portfolio account on this market.
+   * Used as account[2] in PermissionlessCrank (FeeSweep) and appended as the
+   * last oracle-tail account in PermissionlessCrank (Liquidate) to receive
+   * the liquidation-cranker fee share.
+   * Null until provisioned via InitPortfolio.
    */
-  hyperpNoPriceSkipped?: boolean;
-  /**
-   * DEX pool address for HYPERP oracle mode.
-   * Passed as account[1] to UpdateHyperpMark instruction.
-   * Populated from Supabase markets.dex_pool_address or mainnet-markets.ts config.
-   */
-  dexPoolAddress?: string;
-  /**
-   * Cached HYPERP DEX pool metadata. Pool owner/vault accounts are static for a
-   * given pool address, so fetching them on every crank just burns RPC quota.
-   */
-  dexPoolResolvedAddress?: string;
-  dexPoolType?: DexType | "unknown";
-  dexPoolRemainingAccounts?: PublicKey[];
+  keeperPortfolio?: PublicKey | null;
 }
 
 /** Process items in batches with delay between batches.
@@ -414,13 +396,13 @@ export class CrankService {
     this.lastDiscoveryTime = Date.now();
     logger.info("Market discovery complete", { totalMarkets: discovered.length });
 
-    // Fetch dex_pool_address + mainnet_ca from Supabase for HYPERP pool lookups
+    // Fetch mainnet_ca from Supabase for price lookup overrides on devnet Quick Launch markets.
     const slabAddresses = discovered.map((m) => m.slabAddress.toBase58());
-    let dbMarkets: Map<string, { dexPoolAddress?: string; mainnetCA?: string }> = new Map();
+    let dbMarkets: Map<string, { mainnetCA?: string }> = new Map();
     try {
       const { data, error } = await getSupabase()
         .from("markets")
-        .select("slab_address, dex_pool_address, mainnet_ca")
+        .select("slab_address, mainnet_ca")
         .in("slab_address", slabAddresses);
       if (error) {
         logger.warn("Supabase market metadata query error", { error: error.message });
@@ -428,20 +410,12 @@ export class CrankService {
       if (data) {
         const base58Re = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
         for (const row of data) {
-          const pool = row.dex_pool_address ?? undefined;
           const ca = row.mainnet_ca ?? undefined;
-          if (pool && !base58Re.test(pool)) {
-            logger.warn("Invalid dex_pool_address from Supabase, ignoring", { slabAddress: row.slab_address, dexPoolAddress: pool });
-            continue;
-          }
           if (ca && !base58Re.test(ca)) {
             logger.warn("Invalid mainnet_ca from Supabase, ignoring", { slabAddress: row.slab_address, mainnetCA: ca });
             continue;
           }
-          dbMarkets.set(row.slab_address, {
-            dexPoolAddress: pool,
-            mainnetCA: ca,
-          });
+          dbMarkets.set(row.slab_address, { mainnetCA: ca });
         }
       }
     } catch (err) {
@@ -464,16 +438,17 @@ export class CrankService {
           consecutiveFailures: 0,
           isActive: true,
           missingDiscoveryCount: 0,
-          dexPoolAddress: dbMeta?.dexPoolAddress,
           mainnetCA: dbMeta?.mainnetCA,
+          // v17: keeperPortfolio is null until provisioned via InitPortfolio.
+          // crankMarket() skips the market if this is null.
+          keeperPortfolio: null,
         });
       } else {
         const state = this.markets.get(key)!;
         state.market = market;
-        // Update pool address and mainnetCA from Supabase on every discovery.
+        // Update mainnetCA from Supabase on every discovery.
         // Use explicit undefined check so a DB null/removal clears stale values (not just truthy-set).
         if (dbMeta !== undefined) {
-          state.dexPoolAddress = dbMeta.dexPoolAddress;
           state.mainnetCA = dbMeta.mainnetCA;
         }
         state.missingDiscoveryCount = 0;
@@ -493,12 +468,6 @@ export class CrankService {
         if (state.foreignOracleSkipped) {
           state.foreignOracleSkipped = false;
           logger.debug("Re-checking foreign oracle skip on rediscovery", { slabAddress: key });
-        }
-        // PERC-1254: Reset hyperpNoPriceSkipped on re-discovery so we retry fetchPrice.
-        // Oracle data may have become available since the last skip (e.g. DEX pool created).
-        if (state.hyperpNoPriceSkipped) {
-          state.hyperpNoPriceSkipped = false;
-          logger.debug("PERC-1254: Re-checking Hyperp no-price skip on rediscovery", { slabAddress: key });
         }
         // PERC-381: Only re-enable permanently skipped (0x4) markets after a long cooldown
         // to avoid crank→skip→rediscover→re-enable→crank thrash loop on stale slabs.
@@ -557,111 +526,48 @@ export class CrankService {
   }
 
   /**
-   * True HYPERP mode: oracle_authority == [0;32] AND index_feed_id == [0;32].
-   * Uses toBytes() check — compatible with both real PublicKey and test mocks.
+   * Resolve the Pyth oracle account for a market.
+   * Returns the slab address itself for admin-oracle or zero-feed markets
+   * (HYPERP oracle mode was removed in v17 — tag 34 is now ConfigureHybridOracle).
    */
-  private isHyperpOracle(market: DiscoveredMarket): boolean {
+  private resolveOracleKey(market: DiscoveredMarket): PublicKey {
+    if (this.isAdminOracle(market)) {
+      return market.slabAddress;
+    }
     const feedBytes = market.config.indexFeedId.toBytes();
     const isZeroFeed = feedBytes.every((b: number) => b === 0);
-    return !this.isAdminOracle(market) && isZeroFeed;
+    if (isZeroFeed) {
+      // Zero feed — use slab as oracle placeholder (no separate oracle account).
+      return market.slabAddress;
+    }
+    const feedHex = Array.from(feedBytes)
+      .map((b: number) => b.toString(16).padStart(2, "0"))
+      .join("");
+    return derivePythPushOraclePDA(feedHex)[0];
   }
 
-  private async resolveHyperpPoolRemainingAccounts(
-    connection: Connection,
-    state: MarketCrankState,
-    poolKey: PublicKey,
-    slabAddress: string,
-  ): Promise<PublicKey[]> {
-    const poolAddress = poolKey.toBase58();
-    if (
-      state.dexPoolResolvedAddress === poolAddress &&
-      state.dexPoolRemainingAccounts !== undefined
-    ) {
-      return state.dexPoolRemainingAccounts;
-    }
-
-    state.dexPoolResolvedAddress = undefined;
-    state.dexPoolType = undefined;
-    state.dexPoolRemainingAccounts = undefined;
-
-    let poolAccountInfo: Awaited<ReturnType<Connection["getAccountInfo"]>>;
-    try {
-      poolAccountInfo = await withTimeout(
-        connection.getAccountInfo(poolKey),
-        RPC_TIMEOUT_MS,
-        `getAccountInfo(${poolAddress})`,
-      );
-    } catch (err) {
-      logger.warn("HYPERP: failed to fetch pool account info for vault detection — sending without remaining accounts", {
-        slabAddress,
-        poolAddress,
-        error: err instanceof Error ? err.message : String(err),
-      });
-      return [];
-    }
-
-    if (poolAccountInfo === null) {
-      logger.warn("HYPERP: pool account not found for vault detection — sending without remaining accounts", {
-        slabAddress,
-        poolAddress,
-      });
-      return [];
-    }
-
-    const dexType = detectDexType(poolAccountInfo.owner);
-    const remainingAccounts: PublicKey[] = [];
-
-    if (dexType === "pumpswap") {
-      // parseDexPool reads baseVault (offset 131) and quoteVault (offset 163)
-      const poolData = new Uint8Array(poolAccountInfo.data);
-      const poolInfo = parseDexPool("pumpswap", poolKey, poolData);
-      if (poolInfo.baseVault && poolInfo.quoteVault) {
-        remainingAccounts.push(poolInfo.baseVault, poolInfo.quoteVault);
-      } else {
-        logger.warn("HYPERP: PumpSwap pool missing vault pubkeys in parsed data — caching empty remaining accounts", {
-          slabAddress,
-          poolAddress,
-        });
-      }
-    } else if (dexType === "meteora-dlmm") {
-      // reserve_y (vault_y) is stored at byte offset 184 in the LbPair account
-      const METEORA_DLMM_OFF_RESERVE_Y = 184;
-      const METEORA_DLMM_MIN_LEN = METEORA_DLMM_OFF_RESERVE_Y + 32;
-      if (poolAccountInfo.data.length >= METEORA_DLMM_MIN_LEN) {
-        const reserveY = new PublicKey(
-          poolAccountInfo.data.slice(METEORA_DLMM_OFF_RESERVE_Y, METEORA_DLMM_OFF_RESERVE_Y + 32),
-        );
-        remainingAccounts.push(reserveY);
-      } else {
-        logger.warn("HYPERP: Meteora DLMM pool data too short to read reserve_y — caching empty remaining accounts", {
-          slabAddress,
-          poolAddress,
-          dataLength: poolAccountInfo.data.length,
-          required: METEORA_DLMM_MIN_LEN,
-        });
-      }
-    } else if (dexType === null) {
-      logger.warn("HYPERP: unknown DEX pool owner — caching empty remaining accounts", {
-        slabAddress,
-        poolAddress,
-        owner: poolAccountInfo.owner.toBase58(),
-      });
-    }
-    // Raydium CLMM: no remaining accounts needed — on-chain price is read
-    // directly from the pool's sqrt_price_x64 field without vault lookups.
-
-    state.dexPoolResolvedAddress = poolAddress;
-    state.dexPoolType = dexType ?? "unknown";
-    state.dexPoolRemainingAccounts = remainingAccounts;
-
-    logger.info("HYPERP: cached DEX pool metadata for cranking", {
-      slabAddress,
-      poolAddress,
-      dexType: state.dexPoolType,
-      remainingAccounts: remainingAccounts.length,
-    });
-
-    return remainingAccounts;
+  /**
+   * Build the account keys for PermissionlessCrank.
+   *
+   * v17 layout: [owner(s,w), market(w), portfolio(w), ...oracleTail(r)]
+   *
+   * The oracle tail contains the resolved oracle account for the asset.
+   * For Pyth-pinned markets this is the Pyth PriceUpdateV2 PDA.
+   * For admin-oracle and zero-feed markets the slab itself is used as a
+   * placeholder (the on-chain crank path reads authority_price_e6 directly).
+   */
+  private buildPermissionlessCrankKeys(
+    owner: PublicKey,
+    market: DiscoveredMarket,
+    portfolio: PublicKey,
+    oracleKey: PublicKey,
+  ): { pubkey: PublicKey; isSigner: boolean; isWritable: boolean }[] {
+    return [
+      { pubkey: owner,                isSigner: true,  isWritable: true  },
+      { pubkey: market.slabAddress,   isSigner: false, isWritable: true  },
+      { pubkey: portfolio,            isSigner: false, isWritable: true  },
+      { pubkey: oracleKey,            isSigner: false, isWritable: false },
+    ];
   }
 
   /** Check if a market is due for cranking based on activity */
@@ -684,172 +590,66 @@ export class CrankService {
       const keypair = this._keypair;
       const programId = market.programId;
 
-      // ── HYPERP mode: permissionless on-chain oracle ──────────────────────
-      // True HYPERP markets (oracle_authority=[0;32], index_feed_id=[0;32]) use
-      // UpdateHyperpMark to read DEX pool state directly on-chain. No off-chain
-      // price push needed — the instruction reads Raydium/PumpSwap/Meteora pools.
-      if (this.isHyperpOracle(market)) {
-        const instructions: TransactionInstruction[] = [];
+      // v17: PermissionlessCrank (tag 5) — per-portfolio/per-asset Refresh model.
+      //
+      // The keeper cranks its own portfolio (action=FeeSweep=0) to keep the
+      // market's fee accrual and funding-rate accounting current. One portfolio
+      // per market is provisioned on first discovery (keeperPortfolio).
+      //
+      // Account layout: [owner(s,w), market(w), portfolio(w), ...oracleTail(r)]
+      //
+      // The oracle tail contains the resolved oracle account for asset_index=0
+      // (Pyth PriceUpdateV2 PDA for Pyth-pinned markets; slab itself for admin
+      // oracle or zero-feed assets). Additional assets would add more tail entries
+      // but for the single-asset v17 baseline one oracle is sufficient.
+      //
+      // v17 CRITICAL: funding_rate_e9 is always hardcoded to 0n by the encoder.
+      // The program hard-rejects any nonzero value with InvalidInstructionData.
 
-        // UpdateHyperpMark: accounts = [slab(writable), dex_pool, clock, ...remaining]
-        //
-        // PERC-SetDexPool security model:
-        //   1. PRIMARY: read dexPool from on-chain config (set by admin via SetDexPool).
-        //      An attacker who compromises Supabase service_role cannot override this.
-        //   2. FALLBACK: if on-chain dexPool is null (old slab / SetDexPool not yet called),
-        //      fall back to state.dexPoolAddress (from Supabase) with a migration warning.
-        //      The on-chain program will reject the UpdateHyperpMark with OracleInvalid anyway
-        //      until SetDexPool is called, so the fallback is only for the transition period.
-        //
-        // If both values exist but differ, log a security alert and use the on-chain value.
-        const onChainDexPool = state.market.config.dexPool;
-        let effectiveDexPoolAddress: string | undefined;
-
-        if (onChainDexPool) {
-          // SECURE PATH: on-chain pinned pool — use this exclusively
-          const onChainStr = onChainDexPool.toBase58();
-          if (state.dexPoolAddress && state.dexPoolAddress !== onChainStr) {
-            logger.warn("SECURITY: Supabase dex_pool_address differs from on-chain pinned dexPool — " +
-              "using on-chain value. If this is unexpected, admin must call SetDexPool to update.", {
-              slabAddress,
-              onChainDexPool: onChainStr,
-              supabaseDexPool: state.dexPoolAddress,
-            });
-          }
-          effectiveDexPoolAddress = onChainStr;
-        } else if (state.dexPoolAddress) {
-          // FALLBACK: on-chain dexPool not set yet (old slab or SetDexPool not called)
-          // The program will reject UpdateHyperpMark with OracleInvalid until admin calls SetDexPool.
-          logger.debug("HYPERP: using Supabase dex_pool_address (on-chain dexPool not set — admin must call SetDexPool)", {
-            slabAddress,
-            dexPoolAddress: state.dexPoolAddress,
-          });
-          effectiveDexPoolAddress = state.dexPoolAddress;
-        }
-
-        if (!effectiveDexPoolAddress) {
-          if (!state.hyperpNoPriceSkipped) {
-            state.hyperpNoPriceSkipped = true;
-            logger.warn("HYPERP market has no dex_pool_address configured — skipping UpdateHyperpMark. " +
-              "Admin must call SetDexPool for this market.", {
-              slabAddress,
-            });
-          }
-          // No pool address → skip oracle update but still crank (funding/liquidation still work)
-        } else {
-          // Build UpdateHyperpMark instruction (tag 34).
-          const hyperpData = encodeUpdateHyperpMark();
-          const poolKey = new PublicKey(effectiveDexPoolAddress);
-
-          // Build accounts: [slab(writable), pool(readonly), clock(readonly), ...remaining]
-          const hyperpKeys: { pubkey: PublicKey; isSigner: boolean; isWritable: boolean }[] = [
-            { pubkey: market.slabAddress, isSigner: false, isWritable: true },
-            { pubkey: poolKey, isSigner: false, isWritable: false },
-            { pubkey: SYSVAR_CLOCK_PUBKEY, isSigner: false, isWritable: false },
-          ];
-
-          const remainingAccounts = await this.resolveHyperpPoolRemainingAccounts(
-            connection,
-            state,
-            poolKey,
-            slabAddress,
-          );
-          for (const pubkey of remainingAccounts) {
-            hyperpKeys.push({ pubkey, isSigner: false, isWritable: false });
-          }
-
-          instructions.push(buildIx({ programId, keys: hyperpKeys, data: hyperpData }));
-          state.hyperpNoPriceSkipped = false;
-        }
-
-        // Crank instruction (always — handles funding, liquidation, GC)
-        const crankData = encodeKeeperCrank({ callerIdx: 65535 });
-        const oracleKey = market.slabAddress; // HYPERP: oracle account is the slab itself
-        const crankKeys = buildAccountMetas(ACCOUNTS_KEEPER_CRANK, [
-          keypair.publicKey,
-          market.slabAddress,
-          SYSVAR_CLOCK_PUBKEY,
-          oracleKey,
-        ]);
-        instructions.push(buildIx({ programId, keys: crankKeys, data: crankData }));
-
-        const __t0 = Date.now();
-        recordAttempt();
-        let sig: string;
-        const __dexType = state.dexPoolType ?? "unknown";
-        try {
-          // UpdateHyperpMark pushes oracle data from the DEX pool on-chain.
-          // txType="crank" for budget/priority-fee tiering; lane="oracle" because
-          // this instruction is oracle data, not a routine funding crank.
-          const sendResult = await sharedTxQueue.enqueue("oracle", () =>
-            keeperSend(connection, instructions, [keypair], "crank", sharedBudget, 3, KEEPER_SEND_OPTS),
-          );
-          if (!sendResult) {
-            recordFailed();
-            updateHyperpMarkTotal.inc({ dex_type: __dexType, result: "skipped" });
-            return false;
-          }
-          sig = sendResult.signature;
-          const __tip = process.env.USE_HELIUS_SENDER === "true"
-            ? parseInt(process.env.JITO_TIP_LAMPORTS ?? "200000", 10)
-            : 0;
-          const __elapsed = Date.now() - __t0;
-          recordLanded(__elapsed, __tip);
-          txSentTotal.inc({ result: "success", type: "crank" });
-          txLandTimeSeconds.observe({ type: "crank", lane: __tip > 0 ? "jito" : "sender" }, __elapsed / 1000);
-          if (__tip > 0) solSpentLamportsTotal.inc({ type: "crank" }, __tip);
-          updateHyperpMarkTotal.inc({ dex_type: __dexType, result: "success" });
-          // Emit CU histogram when the instruction list includes UpdateHyperpMark
-          // (instructions.length > 1 means the pool address was resolved and the
-          // instruction was actually appended; length === 1 is crank-only / no-pool path).
-          if (sendResult.simulatedCu > 0 && instructions.length > 1) {
-            updateHyperpMarkCu.observe({ dex_type: __dexType }, sendResult.simulatedCu);
-          }
-        } catch (err) {
-          recordFailed();
-          updateHyperpMarkTotal.inc({ dex_type: __dexType, result: "failed" });
-          throw err;
-        }
-        state.lastCrankTime = Date.now();
-        state.successCount++;
-        state.consecutiveFailures = 0;
-        state.alertedAt5 = false; // B1: reset alert latch on success
-        state.isActive = true;
-        // B10: do NOT reset failureCount — it is the lifetime counter exposed
-        // by /status, used to compute the long-run error rate. Resetting it on
-        // every success made the rate read 0 forever; only the per-streak
-        // counter (consecutiveFailures) should reset.
-        eventBus.publish("crank.success", slabAddress, { signature: sig });
-        return true;
+      // Skip if we don't yet have a keeper portfolio for this market.
+      // Portfolio provisioning is done at discover() time; log once per market.
+      if (!state.keeperPortfolio) {
+        logger.debug("Skipping crank — keeper portfolio not provisioned yet", { slabAddress });
+        return false;
       }
 
-      // Admin-push oracle was removed by percolator-prog Phase G — all markets
-      // now read Pyth/Chainlink/Hyperp directly. The foreign-oracle skip, the
-      // bundled price-push, and the admin-hyperp guard that used to live here
-      // are no longer reachable (oracle_authority is zero on all new markets
-      // and the on-chain PushOraclePrice handler was deleted).
+      const oracleKey = this.resolveOracleKey(market);
 
-      const instructions: TransactionInstruction[] = [];
-
-      // Crank instruction
-      const crankData = encodeKeeperCrank({ callerIdx: 65535 });
-
-      let oracleKey: PublicKey;
-      if (this.isAdminOracle(market)) {
-        oracleKey = market.slabAddress;
-      } else {
-        const feedHex = Array.from(market.config.indexFeedId.toBytes())
-          .map(b => b.toString(16).padStart(2, "0")).join("");
-        oracleKey = derivePythPushOraclePDA(feedHex)[0];
+      // Fetch current slot for nowSlot arg (crank freshness check).
+      let nowSlot: bigint;
+      try {
+        nowSlot = BigInt(await withTimeout(
+          connection.getSlot("processed"),
+          RPC_TIMEOUT_MS,
+          "getSlot",
+        ));
+      } catch (err) {
+        logger.warn("Failed to fetch slot for crank — using 0n as nowSlot", {
+          slabAddress,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        nowSlot = 0n;
       }
 
-      const crankKeys = buildAccountMetas(ACCOUNTS_KEEPER_CRANK, [
+      const crankData = encodePermissionlessCrank({
+        action: CrankAction.FeeSweep,
+        assetIndex: 0,
+        nowSlot,
+        closeQ: 0n,
+        feeBps: 0n,
+        recoveryReason: 0,
+      });
+
+      const crankKeys = this.buildPermissionlessCrankKeys(
         keypair.publicKey,
-        market.slabAddress,
-        SYSVAR_CLOCK_PUBKEY,
+        market,
+        state.keeperPortfolio,
         oracleKey,
-      ]);
-      instructions.push(buildIx({ programId, keys: crankKeys, data: crankData }));
+      );
+
+      const instructions: TransactionInstruction[] = [
+        buildIx({ programId, keys: crankKeys, data: crankData }),
+      ];
 
       // PERC-204: Use keeper-optimized send (skipPreflight + multi-RPC + tight CU)
       const __t0 = Date.now();
@@ -885,7 +685,7 @@ export class CrankService {
       state.consecutiveFailures = 0;
       state.alertedAt5 = false; // B1: reset alert latch on success
       state.isActive = true;
-      // B10: see HYPERP branch above — preserve lifetime failureCount.
+      // B10: preserve lifetime failureCount — only per-streak counter resets.
 
       eventBus.publish("crank.success", slabAddress, { signature: sig });
       return true;
@@ -896,15 +696,10 @@ export class CrankService {
 
       const errMsg = err instanceof Error ? err.message : String(err);
 
-      // P1 FIX: Detect InsufficientDexLiquidity (error 0x25 = 37) specifically.
-      // This is a permanent program-level rejection — the DEX pool doesn't meet the
-      // MIN_DEX_QUOTE_LIQUIDITY threshold. Log clearly so operators know the fix is
-      // to either change the pool or redeploy the program with a lower threshold.
+      // Detect permanent program rejections that won't resolve without admin action.
       if (errMsg.includes("Custom\":37") || errMsg.includes("custom program error: 0x25")) {
-        logger.error("InsufficientDexLiquidity — DEX pool does not meet program minimum liquidity threshold. " +
-          "Fix: use a pool with more liquidity, or redeploy the program with a lower MIN_DEX_QUOTE_LIQUIDITY.", {
+        logger.error("PermissionlessCrank rejected (Custom 37) — market configuration issue.", {
           slabAddress,
-          dexPoolAddress: state.dexPoolAddress ?? "none",
           programId: market.programId.toBase58(),
           consecutiveFailures: state.consecutiveFailures + 1,
         });
@@ -964,21 +759,17 @@ export class CrankService {
   let success = 0;
   let failed = 0;
 
-  // NEW: split skipped into categories
+  // Split skipped into categories for observability.
   let skippedPermanent = 0;
   let skippedForeignOracle = 0;
-  let skippedHyperpNoPrice = 0;
+  let skippedNoPortfolio = 0;
   let skippedStalePaused = 0;
   let skippedFailures = 0;
   let skippedNotDue = 0;
 
   const MAX_CONSECUTIVE_FAILURES = 10;
 
-  // GH#1251: Load the keeper key once here so we can check authority live.
-  // We re-evaluate foreign oracle authority at crankAll time rather than relying on
-  // state.foreignOracleSkipped.  After discover() resets the flag, crankMarket() would
-  // return false (and set failed++) instead of skipped.  Checking here means those markets
-  // are categorised as skipped before they even enter the crank queue.
+  // Load the keeper key once here so we can check oracle authority live.
   const keeperKey = this._keypair.publicKey;
 
   const toCrank: string[] = [];
@@ -989,26 +780,15 @@ export class CrankService {
       txSentTotal.inc({ result: "drop", type: "crank" });
       continue;
     }
-    // GH#1251: Live authority check — covers both the steady-state case (flag already set)
-    // and the post-discover() window where the flag was just reset.
-    // Any admin-oracle market where the keeper is NOT the oracle authority is always skipped.
+    // v17: admin-oracle markets where the keeper is NOT the oracle authority
+    // cannot be cranked — the program reads oracle data via oracleAuthority key.
     if (
       this.isAdminOracle(state.market) &&
       !keeperKey.equals(state.market.config.oracleAuthority)
     ) {
-      // Keep the flag in sync so crankMarket() also fast-paths correctly.
       if (!state.foreignOracleSkipped) {
         state.foreignOracleSkipped = true;
-        // GH#1748: Use WARN (not debug) on first detection, include both keys so ops can
-        // immediately diagnose a CRANK_KEYPAIR mismatch without reading the source.
-        logger.warn("crankAll: admin-oracle market skipped — keeper is NOT the oracle authority (key mismatch). " +
-          "Fix: set CRANK_KEYPAIR to the oracle authority key, or update the on-chain oracle authority.", {
-          slabAddress,
-          marketOracleAuthority: state.market.config.oracleAuthority.toBase58(),
-          keeperPublicKey: keeperKey.toBase58(),
-        });
-      } else {
-        logger.debug("crankAll: re-skipping foreign oracle market (flag was reset by discover)", {
+        logger.warn("crankAll: admin-oracle market skipped — keeper is NOT the oracle authority.", {
           slabAddress,
           marketOracleAuthority: state.market.config.oracleAuthority.toBase58(),
           keeperPublicKey: keeperKey.toBase58(),
@@ -1017,30 +797,15 @@ export class CrankService {
       skippedForeignOracle++;
       continue;
     }
-    // PERC-1254: Live Hyperp-no-price check.
-    // Condition: admin-oracle market where keeper IS the authority, indexFeedId=all-zeros
-    // (Hyperp mode), and on-chain authority_price_e6 is still 0.  Sending KeeperCrank in
-    // this state causes OracleInvalid (0xc).  Skip eagerly — crankMarket() would return
-    // false and the batch counts it as failed rather than skipped.
-    // The flag (state.hyperpNoPriceSkipped) is set here for the first time on new markets
-    // so crankMarket's guard also short-circuits on subsequent calls.
-    {
-      const isHyperpAdminOwner =
-        this.isAdminOracle(state.market) &&
-        keeperKey.equals(state.market.config.oracleAuthority) &&
-        state.market.config.indexFeedId.toBytes().every((b: number) => b === 0);
-      const onChainPriceZero = (state.market.config.authorityPriceE6 ?? BigInt(0)) === BigInt(0);
-      if (isHyperpAdminOwner && onChainPriceZero) {
-        if (!state.hyperpNoPriceSkipped) {
-          state.hyperpNoPriceSkipped = true;
-          logger.debug("crankAll: Hyperp-mode market with zero authority_price_e6 — skipping to prevent OracleInvalid (0xc)", { slabAddress });
-        }
-        skippedHyperpNoPrice++;
-        continue;
-      }
+
+    // v17: skip markets where keeper portfolio is not yet provisioned.
+    // crankMarket() would return false silently; count as skipped here instead.
+    if (!state.keeperPortfolio) {
+      skippedNoPortfolio++;
+      continue;
     }
 
-    // PERC-8108: Skip markets paused due to stale oracle (>10min without price push)
+    // Skip markets paused due to stale oracle (>10min without price push).
     if (this._stalePauseCheck?.(slabAddress)) {
       skippedStalePaused++;
       continue;
@@ -1067,8 +832,8 @@ export class CrankService {
     toCrank.push(slabAddress);
   }
 
-  // NEW: meaningful accounting check
-  const skipped = skippedPermanent + skippedForeignOracle + skippedHyperpNoPrice + skippedStalePaused + skippedFailures + skippedNotDue;
+  // Meaningful accounting check.
+  const skipped = skippedPermanent + skippedForeignOracle + skippedNoPortfolio + skippedStalePaused + skippedFailures + skippedNotDue;
   const total = this.markets.size;
   const accounted = toCrank.length + skipped;
 
@@ -1079,7 +844,7 @@ export class CrankService {
       skipped,
       skippedPermanent,
       skippedForeignOracle,
-      skippedHyperpNoPrice,
+      skippedNoPortfolio,
       skippedStalePaused,
       skippedFailures,
       skippedNotDue,
@@ -1133,7 +898,7 @@ export class CrankService {
       toCrank: toCrank.length,
       ...(skippedFailures > 0 && { skippedFailures }),
       ...(skippedForeignOracle > 0 && { skippedForeignOracle }),
-      ...(skippedHyperpNoPrice > 0 && { skippedHyperpNoPrice }),
+      ...(skippedNoPortfolio > 0 && { skippedNoPortfolio }),
       ...(skippedPermanent > 0 && { skippedPermanent }),
       ...(skippedStalePaused > 0 && { skippedStalePaused }),
       ...(skippedNotDue > 0 && { skippedNotDue }),
@@ -1214,6 +979,8 @@ export class CrankService {
         isActive: true,
         missingDiscoveryCount: 0,
         mainnetCA,
+        // v17: keeperPortfolio must be provisioned before this market can be cranked.
+        keeperPortfolio: null,
       });
 
       logger.info("Hot-registered new market", { slabAddress, programId: programId.toBase58() });
