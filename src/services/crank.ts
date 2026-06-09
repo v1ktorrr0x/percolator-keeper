@@ -3,6 +3,7 @@ import type { Connection, TransactionInstruction } from "@solana/web3.js";
 import {
   discoverMarkets,
   encodePermissionlessCrank,
+  encodeRestartAssetOracle,
   CrankAction,
   buildIx,
   derivePythPushOraclePDA,
@@ -574,6 +575,71 @@ export class CrankService {
   private isDue(state: MarketCrankState): boolean {
     const interval = state.isActive ? this.intervalMs : this.inactiveIntervalMs;
     return Date.now() - state.lastCrankTime >= interval;
+  }
+
+  /**
+   * RestartAssetOracle (tag 69) — permissionless oracle recovery path.
+   *
+   * Sends a RestartAssetOracle instruction to un-stick a stale or hung oracle
+   * on a given market/asset. Anyone can call this instruction.
+   *
+   * v17 account layout: [authority(s), market(w)]
+   *
+   * This is a keeper-initiated recovery path: if the keeper detects that a
+   * market's oracle has been stale for too long (e.g., OracleInvalid 0xc on
+   * every crank), it can try to restart the oracle with the last known price.
+   *
+   * @param slabAddress  The market slab address.
+   * @param assetIndex   Asset/domain index (default 0 for single-asset markets).
+   * @param initialPrice Initial mark price in e6 units (from last known good price).
+   * @returns The transaction signature, or null on failure.
+   */
+  async restartOracle(
+    slabAddress: string,
+    assetIndex = 0,
+    initialPrice: bigint = 0n,
+  ): Promise<string | null> {
+    const state = this.markets.get(slabAddress);
+    if (!state) {
+      logger.warn("restartOracle: market not found", { slabAddress });
+      return null;
+    }
+    const connection = getConnection();
+    const keypair = this._keypair;
+    const programId = state.market.programId;
+
+    let nowSlot: bigint;
+    try {
+      nowSlot = BigInt(await withTimeout(
+        connection.getSlot("processed"),
+        RPC_TIMEOUT_MS,
+        "getSlot(restartOracle)",
+      ));
+    } catch {
+      nowSlot = 0n;
+    }
+
+    const data = encodeRestartAssetOracle({ assetIndex, nowSlot, initialPrice });
+    const keys = [
+      { pubkey: keypair.publicKey,          isSigner: true,  isWritable: false },
+      { pubkey: state.market.slabAddress,   isSigner: false, isWritable: true  },
+    ];
+    const instruction = buildIx({ programId, keys, data });
+
+    try {
+      const sendResult = await sharedTxQueue.enqueue("crank", () =>
+        keeperSend(connection, [instruction], [keypair], "crank", sharedBudget, 3, KEEPER_SEND_OPTS),
+      );
+      if (!sendResult) return null;
+      logger.info("RestartAssetOracle sent", { slabAddress, assetIndex, initialPrice: initialPrice.toString(), signature: sendResult.signature });
+      return sendResult.signature;
+    } catch (err) {
+      logger.error("RestartAssetOracle failed", {
+        slabAddress,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
   }
 
   async crankMarket(slabAddress: string): Promise<boolean> {
