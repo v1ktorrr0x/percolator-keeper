@@ -75,6 +75,10 @@ export class OracleService {
   // prices, which never advance this clock) causes the market to age into
   // staleness rather than cranking on a frozen price forever.
   private lastExternalPriceMs = new Map<string, number>();
+  // H1: Track consecutive deviation rejections per slab to avoid permanent anchor lock.
+  // After DEVIATION_ACCEPT_AFTER consecutive rejections, accept the price as legitimate.
+  private deviationRejections = new Map<string, number>();
+  private static readonly DEVIATION_ACCEPT_AFTER = 5;
 
   /** Injectable clock — defaults to Date.now() in production; overridden in
    *  tests so price freshness / staleness is deterministic without faking the
@@ -366,6 +370,10 @@ export class OracleService {
     }
 
     // R2-S4: Historical deviation check — reject if >30% change from last known price
+    // H1: After DEVIATION_ACCEPT_AFTER consecutive rejections for the same market,
+    // accept the price as a legitimate move. Cross-validation (DexScreener + Jupiter
+    // within 10%) already guards against bad data, so consecutive cross-validated
+    // prices at the new level are almost certainly legitimate.
     const HISTORICAL_DEVIATION_MAX_BPS = 3000; // 30.00%
     const history = this.priceHistory.get(slabAddress);
     if (history && history.length > 0) {
@@ -375,18 +383,34 @@ export class OracleService {
           ? Number((priceE6 - lastPrice) * 10_000n / lastPrice)
           : Number((lastPrice - priceE6) * 10_000n / lastPrice);
         if (deviationBps > HISTORICAL_DEVIATION_MAX_BPS) {
-          logger.warn("Price deviation exceeds threshold", {
+          const consecutiveCount = (this.deviationRejections.get(slabAddress) ?? 0) + 1;
+          this.deviationRejections.set(slabAddress, consecutiveCount);
+          if (consecutiveCount < OracleService.DEVIATION_ACCEPT_AFTER) {
+            logger.warn("Price deviation exceeds threshold", {
+              mint,
+              deviationBps,
+              thresholdBps: HISTORICAL_DEVIATION_MAX_BPS,
+              lastPrice: lastPrice.toString(),
+              newPrice: priceE6.toString(),
+              source,
+              consecutiveRejections: consecutiveCount,
+              acceptAfter: OracleService.DEVIATION_ACCEPT_AFTER,
+            });
+            return null;
+          }
+          logger.warn("Accepting deviated price after consecutive rejections (H1)", {
             mint,
             deviationBps,
-            thresholdBps: HISTORICAL_DEVIATION_MAX_BPS,
+            consecutiveRejections: consecutiveCount,
             lastPrice: lastPrice.toString(),
             newPrice: priceE6.toString(),
-            source
+            source,
           });
-          return null;
         }
       }
     }
+    // H1: Price accepted — reset consecutive rejection counter
+    this.deviationRejections.delete(slabAddress);
 
     const entry: PriceEntry = { priceE6, source, timestamp: this.now() };
     this.recordPrice(slabAddress, entry);
