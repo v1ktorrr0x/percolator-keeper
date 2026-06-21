@@ -433,7 +433,7 @@ describe('CrankService', () => {
 
       const result = await crankService.crankMarket(slabAddress);
 
-      expect(result).toBe(true);
+      expect(result).toBe('success');
       expect(keeperSendModule.keeperSend).toHaveBeenCalled();
 
       const state = crankService.getMarkets().get(slabAddress);
@@ -464,7 +464,7 @@ describe('CrankService', () => {
 
       const result = await crankService.crankMarket(slabAddress);
 
-      expect(result).toBe(false);
+      expect(result).toBe('failed');
 
       const state = crankService.getMarkets().get(slabAddress);
       expect(state?.failureCount).toBe(1);
@@ -566,7 +566,7 @@ describe('CrankService', () => {
       // First crankMarket attempt fails. lastCrankTime must advance.
       vi.mocked(keeperSendModule.keeperSend).mockRejectedValue(new Error('rpc error'));
       const result = await crankService.crankMarket(slabAddress);
-      expect(result).toBe(false);
+      expect(result).toBe('failed');
 
       const stateAfterOneFailure = crankService.getMarkets().get(slabAddress)!;
       expect(stateAfterOneFailure.consecutiveFailures).toBe(1);
@@ -639,8 +639,8 @@ describe('CrankService', () => {
       await crankService.discover();
       setKeeperPortfolios(crankService);
 
-      expect(await crankService.crankMarket(slabAddress)).toBe(true);
-      expect(await crankService.crankMarket(slabAddress)).toBe(true);
+      expect(await crankService.crankMarket(slabAddress)).toBe('success');
+      expect(await crankService.crankMarket(slabAddress)).toBe('success');
 
       expect(keeperSendModule.keeperSend).toHaveBeenCalledTimes(2);
       expect(keeperSendModule.keeperSend).toHaveBeenLastCalledWith(
@@ -693,7 +693,7 @@ describe('CrankService', () => {
 
       const result = await crankService.crankMarket(slabAddress);
 
-      expect(result).toBe(false);
+      expect(result).toBe('skipped');
       expect(sendSpy).not.toHaveBeenCalled();
 
       // Clean up so this test doesn't pollute later tests in the suite.
@@ -892,7 +892,7 @@ describe('CrankService', () => {
 
       const result = await crankService.crankMarket(slabAddress);
 
-      expect(result).toBe(false);
+      expect(result).toBe('skipped');
       // Should NOT have submitted a transaction
       expect(keeperSendModule.keeperSend).not.toHaveBeenCalled();
 
@@ -965,7 +965,7 @@ describe('CrankService', () => {
       vi.mocked(keeperSendModule.keeperSend).mockResolvedValue({ signature: 'sig-own-oracle', estimatedCost: 5000 } as any);
       const result = await crankService.crankMarket(slabAddress);
 
-      expect(result).toBe(true);
+      expect(result).toBe('success');
       expect(keeperSendModule.keeperSend).toHaveBeenCalled();
 
       const state = crankService.getMarkets().get(slabAddress)!;
@@ -1251,7 +1251,7 @@ describe('CrankService', () => {
         state.dexPoolRemainingAccounts = [];
 
         const result2 = await localCrank.crankMarket(slabHyperp);
-        expect(result2).toBe(true);
+        expect(result2).toBe('success');
         const stateAfterCrank = localCrank.getMarkets().get(slabHyperp)!;
         expect(stateAfterCrank.hyperpNoPriceSkipped).toBeFalsy();
       } finally {
@@ -1782,79 +1782,118 @@ describe('CrankService', () => {
       };
     }
 
-    it('resets consecutiveFailures on a fast-path tick, not just on full rediscovery', async () => {
+    it('does NOT reset consecutiveFailures on a fast-path tick, but resets them on full rediscovery', async () => {
       const service = new CrankService(mockOracleService, undefined, makeFakeLoader());
       const internal: any = service;
+      const market = makeMarket();
       internal.markets.set(SLAB, {
-        market: makeMarket(),
+        market,
         missingDiscoveryCount: 0,
         consecutiveFailures: 7,
         isActive: false,
       });
       internal._lastFullRediscoverTime = Date.now(); // stay in the fast-path window
 
+      vi.mocked(core.discoverMarkets).mockResolvedValue([market as any]);
+
       await service.discover();
 
       const state = internal.markets.get(SLAB);
-      expect(state.consecutiveFailures).toBe(0);
-      expect(state.isActive).toBe(true);
+      expect(state.consecutiveFailures).toBe(7); // unchanged
+      expect(state.isActive).toBe(false); // unchanged
+
+      // Now trigger full rediscovery by advancing time past the interval
+      internal._lastFullRediscoverTime = Date.now() - internal._fullRediscoverIntervalMs - 1;
+      await service.discover();
+
+      const stateAfterFull = internal.markets.get(SLAB);
+      expect(stateAfterFull.consecutiveFailures).toBe(0);
+      expect(stateAfterFull.isActive).toBe(true);
 
       service.stop();
     });
 
-    it('resets foreignOracleSkipped on a fast-path tick', async () => {
+    it('does NOT reset foreignOracleSkipped on a fast-path tick, but resets on full rediscovery', async () => {
       const service = new CrankService(mockOracleService, undefined, makeFakeLoader());
       const internal: any = service;
+      const market = makeMarket();
       internal.markets.set(SLAB, {
-        market: makeMarket(),
+        market,
         missingDiscoveryCount: 0,
         consecutiveFailures: 0,
         foreignOracleSkipped: true,
       });
       internal._lastFullRediscoverTime = Date.now();
 
+      vi.mocked(core.discoverMarkets).mockResolvedValue([market as any]);
+
       await service.discover();
 
-      expect(internal.markets.get(SLAB).foreignOracleSkipped).toBe(false);
+      expect(internal.markets.get(SLAB).foreignOracleSkipped).toBe(true); // unchanged
+
+      // trigger full rediscovery
+      internal._lastFullRediscoverTime = Date.now() - internal._fullRediscoverIntervalMs - 1;
+      await service.discover();
+
+      expect(internal.markets.get(SLAB).foreignOracleSkipped).toBe(false); // reset
 
       service.stop();
     });
 
-    it('re-enables a permanentlySkipped market on a fast-path tick once its cooldown has elapsed', async () => {
+    it('does NOT re-enable a permanentlySkipped market on a fast-path tick once its cooldown has elapsed, but resets on full rediscovery', async () => {
       const service = new CrankService(mockOracleService, undefined, makeFakeLoader());
       const internal: any = service;
+      const market = makeMarket();
       internal.markets.set(SLAB, {
-        market: makeMarket(),
+        market,
         missingDiscoveryCount: 0,
         consecutiveFailures: 0,
         permanentlySkipped: true,
-        permanentlySkippedAt: Date.now() - 3_600_001, // 1h cooldown (skipCount=1) elapsed
+        permanentlySkippedAt: Date.now() - 3_600_001, // 1h cooldown elapsed
         skipCount: 1,
       });
       internal._lastFullRediscoverTime = Date.now();
+
+      vi.mocked(core.discoverMarkets).mockResolvedValue([market as any]);
 
       await service.discover();
 
       const state = internal.markets.get(SLAB);
-      expect(state.permanentlySkipped).toBe(false);
-      expect(state.consecutiveFailures).toBe(0);
+      expect(state.permanentlySkipped).toBe(true); // unchanged
+
+      // trigger full rediscovery
+      internal._lastFullRediscoverTime = Date.now() - internal._fullRediscoverIntervalMs - 1;
+      await service.discover();
+
+      const stateAfterFull = internal.markets.get(SLAB);
+      expect(stateAfterFull.permanentlySkipped).toBe(false);
+      expect(stateAfterFull.consecutiveFailures).toBe(0);
 
       service.stop();
     });
 
-    it('does NOT re-enable a permanentlySkipped market on a fast-path tick while still in cooldown', async () => {
+    it('does NOT re-enable a permanentlySkipped market on a fast-path tick or full rediscovery tick while still in cooldown', async () => {
       const service = new CrankService(mockOracleService, undefined, makeFakeLoader());
       const internal: any = service;
+      const market = makeMarket();
       internal.markets.set(SLAB, {
-        market: makeMarket(),
+        market,
         missingDiscoveryCount: 0,
         consecutiveFailures: 0,
         permanentlySkipped: true,
-        permanentlySkippedAt: Date.now(), // just skipped, cooldown not elapsed
+        permanentlySkippedAt: Date.now(), // just skipped
         skipCount: 1,
       });
       internal._lastFullRediscoverTime = Date.now();
 
+      vi.mocked(core.discoverMarkets).mockResolvedValue([market as any]);
+
+      await service.discover();
+
+      expect(internal.markets.get(SLAB).permanentlySkipped).toBe(true);
+
+      // trigger full rediscovery
+      internal._lastFullRediscoverTime = Date.now() - internal._fullRediscoverIntervalMs - 1;
       await service.discover();
 
       expect(internal.markets.get(SLAB).permanentlySkipped).toBe(true);

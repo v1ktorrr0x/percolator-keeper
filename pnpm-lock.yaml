@@ -4,9 +4,6 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
-overrides:
-  vite: 8.0.8
-
 importers:
 
   .:
@@ -462,7 +459,7 @@ packages:
     resolution: {integrity: sha512-VBFWMTBvHxS11Z5Lvlr3IWgrwhMTXV+Md+EQF0Xf60+wAdsGFTBx7X7K/hP4pi8N7dcm1RvcHwDxZ16Qx8keUg==}
 
   '@percolatorct/sdk@https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/13f3012918003d995ee8a3793d8817b8c19f9762':
-    resolution: {tarball: https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/13f3012918003d995ee8a3793d8817b8c19f9762}
+    resolution: {gitHosted: true, tarball: https://codeload.github.com/dcccrypto/percolator-sdk/tar.gz/13f3012918003d995ee8a3793d8817b8c19f9762}
     version: 3.0.0
     engines: {node: '>=20.0.0'}
 
@@ -820,7 +817,7 @@ packages:
     resolution: {integrity: sha512-Ize4iQtEALHDttPRCmN+FKqOl2vxTiNUhzobQFFt/BM1lRUTG7zRCLOykG/6Vo4E4hnUdfVLo5/eqKPukcWW7Q==}
     peerDependencies:
       msw: ^2.4.9
-      vite: 8.0.8
+      vite: ^6.0.0 || ^7.0.0 || ^8.0.0
     peerDependenciesMeta:
       msw:
         optional: true
@@ -1424,7 +1421,7 @@ packages:
       '@vitest/ui': 4.1.2
       happy-dom: '*'
       jsdom: '*'
-      vite: 8.0.8
+      vite: ^6.0.0 || ^7.0.0 || ^8.0.0
     peerDependenciesMeta:
       '@edge-runtime/vm':
         optional: true

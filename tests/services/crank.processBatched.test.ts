@@ -70,51 +70,61 @@ import { processBatched } from "../../src/services/crank.js";
 // A.15: succeeded + failed must always equal the input length, and a thrown
 // error must be counted exactly once (never both as success AND failure).
 describe("processBatched (A.15)", () => {
-  type Outcome = "success" | "fail" | "throw";
+  type Outcome = "success" | "fail" | "throw" | "skip";
 
-  function runWithOutcomes(outcomes: Outcome[]): Promise<{ succeeded: number; failed: number; errors: Map<string, Error> }> {
+  function runWithOutcomes(outcomes: Outcome[]): Promise<{
+    succeeded: number;
+    failed: number;
+    skipped: number;
+    errors: Map<string, Error>;
+  }> {
     const items = outcomes.map((_, i) => i);
     return processBatched(items, 5, 0, async (idx) => {
       const out = outcomes[idx as number]!;
       if (out === "throw") throw new Error(`thrown by item ${idx}`);
-      return out === "success";
+      if (out === "success") return "success";
+      if (out === "skip") return "skipped";
+      return "failed";
     });
   }
 
-  it("succeeded + failed === items.length for a known mix", async () => {
-    const { succeeded, failed } = await runWithOutcomes([
-      "success", "fail", "throw", "success", "fail", "throw", "success", "success",
+  it("succeeded + failed + skipped === items.length for a known mix", async () => {
+    const { succeeded, failed, skipped } = await runWithOutcomes([
+      "success", "fail", "throw", "success", "skip", "fail", "throw", "success", "success",
     ]);
-    // 4 success, 2 fail, 2 throw → 4 succeeded, 4 failed
-    expect(succeeded + failed).toBe(8);
+    // 4 success, 1 skip, 2 fail, 2 throw → 4 succeeded, 4 failed, 1 skipped
+    expect(succeeded + failed + skipped).toBe(9);
     expect(succeeded).toBe(4);
     expect(failed).toBe(4);
+    expect(skipped).toBe(1);
   });
 
-  it("thrown errors are counted as failed (not as success), exactly once each", async () => {
-    const { succeeded, failed, errors } = await runWithOutcomes(["throw", "throw", "throw"]);
+  it("thrown errors are counted as failed (not as success or skip), exactly once each", async () => {
+    const { succeeded, failed, skipped, errors } = await runWithOutcomes(["throw", "throw", "throw"]);
     expect(succeeded).toBe(0);
     expect(failed).toBe(3);
+    expect(skipped).toBe(0);
     expect(errors.size).toBe(3);
   });
 
   it("empty input → zero counts, zero errors", async () => {
-    const { succeeded, failed, errors } = await runWithOutcomes([]);
+    const { succeeded, failed, skipped, errors } = await runWithOutcomes([]);
     expect(succeeded).toBe(0);
     expect(failed).toBe(0);
+    expect(skipped).toBe(0);
     expect(errors.size).toBe(0);
   });
 
-  it("property: succeeded + failed always equals items.length across random mixes", async () => {
+  it("property: succeeded + failed + skipped always equals items.length across random mixes", async () => {
     await fc.assert(
       fc.asyncProperty(
-        fc.array(fc.constantFrom<Outcome>("success", "fail", "throw"), {
+        fc.array(fc.constantFrom<Outcome>("success", "fail", "throw", "skip"), {
           minLength: 0,
           maxLength: 50,
         }),
         async (outcomes) => {
-          const { succeeded, failed } = await runWithOutcomes(outcomes);
-          return succeeded + failed === outcomes.length;
+          const { succeeded, failed, skipped } = await runWithOutcomes(outcomes);
+          return succeeded + failed + skipped === outcomes.length;
         },
       ),
       { numRuns: 100 },
@@ -124,7 +134,7 @@ describe("processBatched (A.15)", () => {
   it("property: succeeded matches the count of 'success' outcomes", async () => {
     await fc.assert(
       fc.asyncProperty(
-        fc.array(fc.constantFrom<Outcome>("success", "fail", "throw"), {
+        fc.array(fc.constantFrom<Outcome>("success", "fail", "throw", "skip"), {
           minLength: 0,
           maxLength: 50,
         }),
@@ -138,10 +148,27 @@ describe("processBatched (A.15)", () => {
     );
   });
 
+  it("property: skipped matches the count of 'skip' outcomes", async () => {
+    await fc.assert(
+      fc.asyncProperty(
+        fc.array(fc.constantFrom<Outcome>("success", "fail", "throw", "skip"), {
+          minLength: 0,
+          maxLength: 50,
+        }),
+        async (outcomes) => {
+          const expected = outcomes.filter((o) => o === "skip").length;
+          const { skipped } = await runWithOutcomes(outcomes);
+          return skipped === expected;
+        },
+      ),
+      { numRuns: 100 },
+    );
+  });
+
   it("property: failed matches the count of 'fail' + 'throw' outcomes (no double-count)", async () => {
     await fc.assert(
       fc.asyncProperty(
-        fc.array(fc.constantFrom<Outcome>("success", "fail", "throw"), {
+        fc.array(fc.constantFrom<Outcome>("success", "fail", "throw", "skip"), {
           minLength: 0,
           maxLength: 50,
         }),
@@ -158,7 +185,7 @@ describe("processBatched (A.15)", () => {
   it("property: errors map size equals the number of thrown outcomes", async () => {
     await fc.assert(
       fc.asyncProperty(
-        fc.array(fc.constantFrom<Outcome>("success", "fail", "throw"), {
+        fc.array(fc.constantFrom<Outcome>("success", "fail", "throw", "skip"), {
           minLength: 0,
           maxLength: 50,
         }),

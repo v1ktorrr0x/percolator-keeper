@@ -38,6 +38,8 @@ import { sharedTxQueue } from "../lib/tx-queue.js";
 import { parseV17RiskParams, V17_RISK_PARAMS_MIN_DATA_LEN } from "../lib/v17-risk.js";
 import { resolveV17OracleTail } from "../lib/v17-oracle-tail.js";
 
+export type CrankResult = "success" | "skipped" | "failed";
+
 const logger = createLogger("keeper:crank");
 
 /** Timeout for individual RPC calls — prevents indefinite hangs on unresponsive nodes. */
@@ -724,23 +726,23 @@ export async function processBatched<T>(
   items: T[],
   batchSize: number,
   delayMs: number,
-  fn: (item: T) => Promise<boolean>,
-): Promise<{ succeeded: number; failed: number; errors: Map<string, Error> }> {
+  fn: (item: T) => Promise<CrankResult>,
+): Promise<{ succeeded: number; failed: number; skipped: number; errors: Map<string, Error> }> {
   const errors = new Map<string, Error>();
   let succeeded = 0;
   let failed = 0;
+  let skipped = 0;
 
   for (let i = 0; i < items.length; i += batchSize) {
     const batch = items.slice(i, i + batchSize);
     type ItemOutcome =
-      | { kind: "ok" }
-      | { kind: "no" }
+      | { kind: "res"; value: CrankResult }
       | { kind: "threw"; itemKey: string; error: Error };
     const outcomes: ItemOutcome[] = await Promise.all(
       batch.map(async (item): Promise<ItemOutcome> => {
         try {
-          const ok = await fn(item);
-          return ok ? { kind: "ok" } : { kind: "no" };
+          const res = await fn(item);
+          return { kind: "res", value: res };
         } catch (err) {
           const itemKey = String(item);
           const errorObj = err instanceof Error ? err : new Error(String(err));
@@ -749,9 +751,11 @@ export async function processBatched<T>(
       }),
     );
     for (const o of outcomes) {
-      if (o.kind === "ok") succeeded++;
-      else if (o.kind === "no") failed++;
-      else {
+      if (o.kind === "res") {
+        if (o.value === "success") succeeded++;
+        else if (o.value === "skipped") skipped++;
+        else failed++;
+      } else {
         failed++;
         errors.set(o.itemKey, o.error);
         logger.error("Batch item failed", { item: o.itemKey, error: o.error.message });
@@ -762,7 +766,7 @@ export async function processBatched<T>(
     }
   }
 
-  return { succeeded, failed, errors };
+  return { succeeded, failed, skipped, errors };
 }
 
 export class CrankService {
@@ -961,10 +965,6 @@ export class CrankService {
         let cacheHits = 0;
         for (const [, state] of this.markets) {
           const key = state.market.slabAddress.toBase58();
-          // M-1: run the same recoverable-state transitions the full-rediscover
-          // branch applies to "already known" markets, every fast-path tick --
-          // not just once every KEEPER_FULL_REDISCOVER_INTERVAL_MS.
-          this._resetRecoverableMarketState(key, state);
           const entry = cache.getOwnerVerified(key, currentSlot, expectedOwner);
           if (entry) {
             // Re-parse the slab from cached bytes so the market state reflects
@@ -1415,7 +1415,7 @@ export class CrankService {
     }
   }
 
-  async crankMarket(slabAddress: string): Promise<boolean> {
+  async crankMarket(slabAddress: string): Promise<CrankResult> {
     // M8: per-market in-flight guard. Bail immediately if another caller is
     // already running crankMarket for this slab. Closes the race where the
     // /register HTTP endpoint and the timer-driven crankAll fan-out both
@@ -1424,13 +1424,13 @@ export class CrankService {
     // crankAll loop, not the per-market work.
     if (this._inflightMarkets.has(slabAddress)) {
       logger.debug("crankMarket: in-flight for slab, skipping concurrent call", { slabAddress });
-      return false;
+      return "skipped";
     }
 
     const state = this.markets.get(slabAddress);
     if (!state) {
       logger.warn("Market not found", { slabAddress });
-      return false;
+      return "skipped";
     }
 
     const { market } = state;
@@ -1463,7 +1463,7 @@ export class CrankService {
       // Portfolio provisioning is done at discover() time; log once per market.
       if (!state.keeperPortfolio) {
         logger.debug("Skipping crank — keeper portfolio not provisioned yet", { slabAddress });
-        return false;
+        return "skipped";
       }
 
       const oracleKey = await this.resolveOracleKey(market);
@@ -1477,11 +1477,11 @@ export class CrankService {
           "getSlot",
         ));
       } catch (err) {
-        logger.warn("Failed to fetch slot for crank — using 0n as nowSlot", {
+        logger.warn("getSlot failed — skipping crank submission", {
           slabAddress,
           error: err instanceof Error ? err.message : String(err),
         });
-        nowSlot = 0n;
+        return "skipped";
       }
 
       const crankData = encodePermissionlessCrank({
@@ -1514,9 +1514,10 @@ export class CrankService {
         );
         if (!sendResult) {
           recordFailed();
-          return false;
+          return "failed";
         }
         sig = sendResult.signature;
+        this._resetRecoverableMarketState(slabAddress, state);
         const __tip = process.env.USE_HELIUS_SENDER === "true"
           ? parseInt(process.env.JITO_TIP_LAMPORTS ?? "200000", 10)
           : 0;
@@ -1538,7 +1539,7 @@ export class CrankService {
       // B10: preserve lifetime failureCount — only per-streak counter resets.
 
       eventBus.publish("crank.success", slabAddress, { signature: sig });
-      return true;
+      return "success";
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       const errLower = errMsg.toLowerCase();
@@ -1616,7 +1617,7 @@ export class CrankService {
           programId: market.programId.toBase58(),
           skipCount: state.skipCount,
         });
-        return false;
+        return "skipped";
       }
 
       // Mark inactive after 10 consecutive failures regardless of lifetime success
@@ -1648,7 +1649,7 @@ export class CrankService {
       eventBus.publish("crank.failure", slabAddress, {
         error: err instanceof Error ? err.message : String(err),
       });
-      return false;
+      return "failed";
     } finally {
       // M8: always release the per-market guard, even if the body throws or
       // returns early. JavaScript runs finally after `return` in the try/catch
@@ -1775,6 +1776,7 @@ export class CrankService {
     );
     success = batchResult.succeeded;
     failed = batchResult.failed;
+    const totalSkipped = skipped + batchResult.skipped;
 
     // DESYNC-5 FIX: LpVaultCrankFees (tag 78) — submit for each successfully
     // cranked market that has an LP vault. This advances the backing-domain
@@ -1807,7 +1809,7 @@ export class CrankService {
     // P0 FIX: Always log cycle result with skip breakdown. Previously only logged
     // when failed > 0, causing skipped-only cycles to produce zero log output.
     logger.info("Crank cycle complete", {
-      success, failed, skipped,
+      success, failed, skipped: totalSkipped,
       toCrank: toCrank.length,
       ...(skippedFailures > 0 && { skippedFailures }),
       ...(skippedForeignOracle > 0 && { skippedForeignOracle }),
@@ -1818,8 +1820,8 @@ export class CrankService {
     });
 
     cycleDurationSeconds.observe({ service: "crank" }, (Date.now() - _crankAllStart) / 1000);
-    this.lastCycleResult = { success, failed, skipped };
-    return { success, failed, skipped };
+    this.lastCycleResult = { success, failed, skipped: totalSkipped };
+    return { success, failed, skipped: totalSkipped };
   }
 
   /**

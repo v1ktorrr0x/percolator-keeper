@@ -337,7 +337,15 @@ function resolveV17WrapperPrice(
       return cfg.oracleTargetPriceE6;
     }
   }
-  return cfg.markEwmaE6;
+  // EWMA staleness guard using oracleTargetPublishTime (since markEwmaPublishTime is unavailable)
+  const MAX_EWMA_STALENESS_SECS = cfg.maxStalenessSecs > 0n ? cfg.maxStalenessSecs * 5n : 300n;
+  const ewmaAge = cfg.oracleTargetPublishTime > 0n
+    ? nowSec - cfg.oracleTargetPublishTime
+    : nowSec;
+  if (cfg.markEwmaE6 > 0n && ewmaAge <= MAX_EWMA_STALENESS_SECS) {
+    return cfg.markEwmaE6;
+  }
+  return 0n;
 }
 
 interface LiquidationCandidate {
@@ -794,8 +802,12 @@ export class LiquidationService {
       let nowSlot: bigint;
       try {
         nowSlot = BigInt(await connection.getSlot("processed"));
-      } catch {
-        nowSlot = 0n;
+      } catch (err) {
+        logger.warn("getSlot failed — skipping liquidation submission", {
+          slabAddress: slabAddress.toBase58(),
+          error: getErrorMessage(err),
+        });
+        return null; // abort this liquidation attempt; next cycle will retry
       }
 
       // DESYNC-4 FIX: For v17 markets, assetIndex comes from the leg (always 0
