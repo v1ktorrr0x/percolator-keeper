@@ -189,6 +189,9 @@ solBalanceCheckInterval.unref();
 // emptied, which never happened during a multi-hour DEX outage — channel got
 // nuked. Track last-alert per slab and re-fire only after STALE_ALERT_COOLDOWN_MS.
 const STALE_ALERT_COOLDOWN_MS = Number(process.env.KEEPER_STALE_ALERT_COOLDOWN_MS ?? 5 * 60_000);
+if (!Number.isFinite(STALE_ALERT_COOLDOWN_MS) || STALE_ALERT_COOLDOWN_MS < 60_000) {
+  throw new Error(`KEEPER_STALE_ALERT_COOLDOWN_MS must be >= 60000, got: ${process.env.KEEPER_STALE_ALERT_COOLDOWN_MS}`);
+}
 const lastStaleAlertByMarket = new Map<string, number>();
 
 const staleCheckInterval = setInterval(() => {
@@ -294,6 +297,11 @@ const healthPort = Number(process.env.KEEPER_HEALTH_PORT ?? 8081);
 // visible on any deploy without a firewall). Operators needing remote access must
 // set KEEPER_HEALTH_BIND_ADDR explicitly (and front it with auth/a proxy).
 const healthBindAddr = process.env.KEEPER_HEALTH_BIND_ADDR ?? "127.0.0.1";
+import net from "node:net";
+if (!net.isIP(healthBindAddr) && healthBindAddr !== "localhost") {
+  throw new Error(`Invalid KEEPER_HEALTH_BIND_ADDR: "${healthBindAddr}"`);
+}
+
 // L4: reject non-integer or out-of-range port values early so misconfiguration
 // is a startup failure rather than a confusing EACCES/EADDRINUSE at listen time.
 if (!Number.isInteger(healthPort) || healthPort < 1 || healthPort > 65535) {
@@ -306,7 +314,8 @@ if (!Number.isInteger(healthPort) || healthPort < 1 || healthPort > 65535) {
 // Prevents brute-force attacks against the shared secret.
 const REGISTER_RATE_WINDOW_MS = 60_000;
 const REGISTER_RATE_MAX_FAILURES = 5;
-const registerFailures = new Map<string, number[]>();
+import { LRUCache } from "lru-cache";
+const registerFailures = new LRUCache<string, number[]>({ max: 10_000 });
 
 function isRateLimited(ip: string): boolean {
   const now = Date.now();
@@ -320,11 +329,6 @@ function recordAuthFailure(ip: string): void {
   const timestamps = registerFailures.get(ip) ?? [];
   timestamps.push(Date.now());
   registerFailures.set(ip, timestamps);
-  // Cap map size to prevent memory exhaustion from many unique IPs
-  if (registerFailures.size > 10_000) {
-    const oldest = registerFailures.keys().next().value;
-    if (oldest !== undefined) registerFailures.delete(oldest);
-  }
 }
 
 // Periodic cleanup: purge IPs whose failure timestamps have all expired.
@@ -372,6 +376,32 @@ const secureJsonHeaders = {
 };
 
 const healthServer = http.createServer((req, res) => {
+  // Authentication check for health and sensitive endpoints when exposed remotely
+  if (healthBindAddr !== "127.0.0.1" && healthBindAddr !== "localhost" && healthBindAddr !== "::1") {
+    if ((req.url === "/health" || req.url === "/pause-status" || req.url === "/shadow/report" || req.url?.startsWith("/shadow/report?")) && req.method === "GET") {
+      const registerSecret = process.env.KEEPER_REGISTER_SECRET ?? "";
+      const provided = String(req.headers["x-shared-secret"] ?? "");
+      let contentMatch = false;
+      if (registerSecret && provided) {
+        const secretBuf = Buffer.from(registerSecret, "utf8");
+        const providedBuf = Buffer.from(provided, "utf8");
+        const maxLen = Math.max(secretBuf.length, providedBuf.length, 1);
+        const secretPad = Buffer.alloc(maxLen);
+        const providedPad = Buffer.alloc(maxLen);
+        secretBuf.copy(secretPad);
+        providedBuf.copy(providedPad);
+        const lengthMatch = secretBuf.length === providedBuf.length;
+        contentMatch = lengthMatch && timingSafeEqual(secretPad, providedPad);
+      }
+      
+      if (!contentMatch) {
+        res.writeHead(401, secureJsonHeaders);
+        res.end(JSON.stringify({ error: "Unauthorized" }));
+        return;
+      }
+    }
+  }
+
   // POST /register — hot-register a new market without waiting for discovery cycle
   // Body: { slabAddress: string, mainnetCA?: string }
   // Auth: requires x-shared-secret header matching KEEPER_REGISTER_SECRET env var (defense-in-depth; #780)
@@ -478,10 +508,10 @@ res.writeHead(401, secureJsonHeaders);
 
   // POST /admin/budget/resume — clear a latched budget circuit-breaker halt
   // without a full restart. Auth mirrors /register: x-shared-secret header
-  // matching KEEPER_REGISTER_SECRET, constant-time compare, per-IP rate limit.
+  // matching KEEPER_ADMIN_SECRET, constant-time compare, per-IP rate limit.
   if (req.url === "/admin/budget/resume" && req.method === "POST") {
-    const registerSecret = process.env.KEEPER_REGISTER_SECRET ?? "";
-    if (!registerSecret) {
+    const adminSecret = process.env.KEEPER_ADMIN_SECRET ?? "";
+    if (!adminSecret) {
       req.resume();
       res.writeHead(503, secureJsonHeaders);
       res.end(JSON.stringify({ success: false, message: "Endpoint not configured" }));
@@ -498,7 +528,7 @@ res.writeHead(401, secureJsonHeaders);
     }
 
     const provided = String(req.headers["x-shared-secret"] ?? "");
-    const secretBuf = Buffer.from(registerSecret, "utf8");
+    const secretBuf = Buffer.from(adminSecret, "utf8");
     const providedBuf = Buffer.from(provided, "utf8");
     const maxLen = Math.max(secretBuf.length, providedBuf.length, 1);
     const secretPad = Buffer.alloc(maxLen);
